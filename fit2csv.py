@@ -2,19 +2,20 @@
 """
 GARMIN FIT to CSV Converter (fit2csv.py)
 
-Garmin公式の `garmin-fit-sdk` を使用して、GARMINのアクティビティデータ（.fit）を解析し、
-CSVファイルを生成する高精度コンバーターです。
+A high-fidelity converter using Garmin's official `garmin-fit-sdk` to decode
+GARMIN activity files (.fit) and generate clean, structured CSV files.
 
-主な出力モード:
-1. Garmin Connect 準拠モード（デフォルト / --type connect）:
-   Garmin Connect ウェブサイトのエクスポートCSVと同一の項目名・表示形式・行階層
-   （複数ラップに跨るワークアウトステップの親行＋子ラップ行＋最下部Summary行）を完全再現。
-   最新メトリクスである Step Speed Loss（cm/s, %）および標高データから算出した Avg GAP（勾配調整ペース）を出力。
+Primary Output Modes:
+1. Garmin Connect Conforming Mode (Default / --type connect):
+   Accurately reproduces the exact column headers, formatting rules, and row hierarchies
+   (parent step rows + child lap rows + activity-wide summary row) matching the Garmin Connect
+   web export. Outputs modern metrics including Step Speed Loss (cm/s, %) and Avg GAP
+   (Grade Adjusted Pace) modeled from barometric elevation.
 
-2. FIT 生データ抽出モード（--type record, lap, split, session, all 等）:
-   FITバイナリから抽出されたメッセージを純粋なテーブル形式で出力。
-   人間向けの加工列を排し、オリジナルの単位とフィールド構造を維持しつつ、
-   緯度経度の度数変換および未定義SSLフィールドの正規化・スケーリングのみを適用。
+2. Raw FIT Data Extraction Mode (--type record, lap, split, session, all, etc.):
+   Exports decoded messages as pure tabular tables without human-oriented formatting clutter.
+   Preserves original units and field structures while normalizing semicircles to degrees
+   and scaling vendor-specific Step Speed Loss fields.
 """
 
 import os
@@ -32,18 +33,18 @@ try:
     import numpy as np
 except ImportError:
     print(
-        "エラー: 必要なライブラリがインストールされていません。\n"
-        "以下のコマンドを実行してインストールしてください:\n"
+        "Error: Required libraries are not installed.\n"
+        "Please run the following command to install dependencies:\n"
         "  pip install garmin-fit-sdk pandas numpy",
         file=sys.stderr,
     )
     sys.exit(1)
 
 
-# --- 単位・フォーマット変換用ヘルパー関数 ---
+# --- Unit & Formatting Helper Functions ---
 
 def is_valid_num(val: Any) -> bool:
-    """数値として有効（NoneでもNaNでもない）か判定"""
+    """Check if a value is a valid number (neither None nor NaN)."""
     if val is None:
         return False
     if isinstance(val, (int, float)):
@@ -52,7 +53,7 @@ def is_valid_num(val: Any) -> bool:
 
 
 def semicircles_to_degrees(semicircles: Optional[int]) -> Optional[float]:
-    """FITファイルのsemicircles単位の緯度経度を度数（degrees）に変換"""
+    """Convert semicircles coordinate to decimal degrees."""
     if not is_valid_num(semicircles):
         return None
     try:
@@ -62,7 +63,7 @@ def semicircles_to_degrees(semicircles: Optional[int]) -> Optional[float]:
 
 
 def round_half_up(val: Any, decimals: int = 0) -> Any:
-    """四捨五入（0.5切り上げ）を行うヘルパー"""
+    """Perform standard arithmetic half-up rounding."""
     if not is_valid_num(val):
         return None
     try:
@@ -74,7 +75,7 @@ def round_half_up(val: Any, decimals: int = 0) -> Any:
 
 
 def pace_seconds_to_str(pace_sec: Optional[float]) -> str:
-    """ペース(秒/km)を 'M:SS' 表記の文字列に変換（Garmin仕様の四捨五入）"""
+    """Convert pace in seconds/km to 'M:SS' formatted string (half-up rounded)."""
     if not is_valid_num(pace_sec) or pace_sec <= 0:
         return ""
     try:
@@ -92,14 +93,14 @@ def pace_seconds_to_str(pace_sec: Optional[float]) -> str:
 
 
 def speed_to_pace_str(speed_mps: Optional[float]) -> str:
-    """速度(m/s)からペース文字列('M:SS')を計算"""
+    """Calculate pace string ('M:SS') from speed in m/s."""
     if not is_valid_num(speed_mps) or speed_mps <= 0:
         return ""
     return pace_seconds_to_str(1000.0 / float(speed_mps))
 
 
 def format_cum_time(seconds: Optional[float]) -> str:
-    """累積タイムのフォーマット (10分未満はコンマ1秒表示、10分以上は秒まで)"""
+    """Format cumulative elapsed time (<10 min includes tenths of a second, >=10 min to integer seconds)."""
     if not is_valid_num(seconds):
         return ""
     try:
@@ -124,7 +125,7 @@ def format_cum_time(seconds: Optional[float]) -> str:
 
 
 def format_lap_time(seconds: Optional[float], is_parent: bool = False) -> str:
-    """ラップタイムのフォーマット（Garmin Connect仕様）"""
+    """Format lap duration (Garmin Connect display specification)."""
     if not is_valid_num(seconds):
         return ""
     try:
@@ -152,7 +153,7 @@ def format_lap_time(seconds: Optional[float], is_parent: bool = False) -> str:
 
 
 def format_gct_balance(balance: Optional[float]) -> str:
-    """接地時間バランス（GCT Balance）を 'XX.X% L / YY.Y% R' 形式に変換（左右合計100.0%を保証）"""
+    """Format Ground Contact Time Balance as 'XX.X% L / YY.Y% R' (guaranteed 100.0% sum)."""
     if not is_valid_num(balance) or balance <= 0:
         return ""
     try:
@@ -166,13 +167,13 @@ def format_gct_balance(balance: Optional[float]) -> str:
         return ""
 
 
-# --- 勾配調整ペース (Grade Adjusted Pace: GAP) 算出関数 ---
+# --- Grade Adjusted Pace (GAP) Calculation ---
 
 def minetti_cost_ratio(grade: float) -> float:
     """
-    Minetti (2002) の走運動エネルギーコスト多項式に基づく平地換算比率の計算
+    Calculate flat-equivalent energy cost ratio based on Minetti (2002) running energy cost polynomial.
     Cr(g) = 155.4 * g^5 - 30.4 * g^4 - 32.8 * g^3 + 43.4 * g^2 + 13.6 * g + 3.6
-    平地換算係数 = Cr(g) / Cr(0) (Cr(0) = 3.6)
+    Cost ratio = Cr(g) / Cr(0), where Cr(0) = 3.6
     """
     g = max(-0.35, min(0.35, grade))
     cr = 155.4 * (g**5) - 30.4 * (g**4) - 32.8 * (g**3) + 43.4 * (g**2) + 13.6 * g + 3.6
@@ -185,7 +186,7 @@ def calculate_segment_gap_pace(
     start_time: Any,
     end_time: Any,
 ) -> str:
-    """指定区間の record 時系列から Minetti モデルに基づいて Avg GAP を計算"""
+    """Calculate Avg GAP for a slice of records using the Minetti energy cost model."""
     if df_rec.empty or smooth_alt is None or len(df_rec) < 2:
         return ""
     try:
@@ -219,11 +220,11 @@ def calculate_segment_gap_pace(
 
 def parse_distance_argument(val_str: str) -> float:
     """
-    距離引数文字列をメートル単位の浮動小数点数に変換する
-    対応フォーマット:
-      - 数値のみ: '2000' -> 2000.0, '500' -> 500.0
-      - 単位 km / k 付き: '2km' -> 2000.0, '1.5KM' -> 1500.0, '2k' -> 2000.0
-      - 単位 m 付き: '500m' -> 500.0, '1000M' -> 1000.0
+    Parse a distance string argument into a float value in meters.
+    Supported formats:
+      - Numeric only: '2000' -> 2000.0, '500' -> 500.0
+      - With km / k suffix: '2km' -> 2000.0, '1.5KM' -> 1500.0, '2k' -> 2000.0
+      - With m suffix: '500m' -> 500.0, '1000M' -> 1000.0
     """
     s = str(val_str).strip().lower()
     try:
@@ -237,18 +238,18 @@ def parse_distance_argument(val_str: str) -> float:
             val = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"無効な距離指定です: '{val_str}'。正の数値または単位付き(例: 2000, 2km, 500m)で指定してください。"
+            f"Invalid distance format: '{val_str}'. Please specify a positive number or distance with unit (e.g. 2000, 2km, 500m)."
         )
 
     if val <= 0:
         raise argparse.ArgumentTypeError(
-            f"距離には正の値を指定してください: '{val_str}'"
+            f"Distance must be a positive value: '{val_str}'"
         )
     return val
 
 
 def calc_records_timer_time(df: pd.DataFrame) -> float:
-    """ポーズ区間（dt > 2.0s）をクランプして実タイマー秒数を算出"""
+    """Calculate active timer duration by clamping pause intervals (dt > 2.0s)."""
     if len(df) <= 1:
         return 1.0
     dts = df["timestamp"].diff().dt.total_seconds().fillna(1.0).values[1:]
@@ -257,8 +258,8 @@ def calc_records_timer_time(df: pd.DataFrame) -> float:
 
 def slice_group_records(g_rec: pd.DataFrame, re_lap_dist: float) -> List[pd.DataFrame]:
     """
-    グループ内のrecord時系列を指定距離（re_lap_dist）ごとにスライスする。
-    端数が10m未満の場合は直前のラップに統合する。
+    Slice record timeseries within a group into intervals of specified distance (re_lap_dist).
+    If the final remainder is less than 10 meters, it is merged into the preceding lap.
     """
     if len(g_rec) < 2:
         return [g_rec]
@@ -276,7 +277,7 @@ def slice_group_records(g_rec: pd.DataFrame, re_lap_dist: float) -> List[pd.Data
         if not cand.empty:
             curr_end_idx = cand.index[0]
             rem_d = g_rec["distance"].iloc[-1] - g_rec["distance"].iloc[curr_end_idx]
-            if rem_d < 10.0:  # 残り10m未満は統合
+            if rem_d < 10.0:  # Merge if remainder is under 10m
                 slices.append(g_rec.iloc[curr_start_idx:n])
                 break
             else:
@@ -299,7 +300,7 @@ def synthesize_lap_from_records(
     group_calc_dist: float,
     group_calories: float,
 ) -> Dict[str, Any]:
-    """record_mesgs のスライスから lap 辞書を合成"""
+    """Synthesize a lap dictionary from a slice of record_mesgs."""
     raw_time = calc_records_timer_time(sub_df)
     time_scale = (group_timer_time / group_calc_time) if group_calc_time > 0 else 1.0
     timer_time = raw_time * time_scale
@@ -312,16 +313,16 @@ def synthesize_lap_from_records(
     spd_col = "enhanced_speed" if "enhanced_speed" in sub_df.columns else ("speed" if "speed" in sub_df.columns else None)
     max_speed = float(sub_df[spd_col].max()) if spd_col and not sub_df[spd_col].isna().all() else avg_speed
 
-    # 心拍
+    # Heart Rate
     avg_hr = round_half_up(sub_df["heart_rate"].mean()) if "heart_rate" in sub_df.columns and not sub_df["heart_rate"].isna().all() else None
     max_hr = int(sub_df["heart_rate"].max()) if "heart_rate" in sub_df.columns and not sub_df["heart_rate"].isna().all() else None
 
-    # ピッチ（1脚分rpm）
+    # Cadence (single-leg rpm)
     cad = float(sub_df["cadence"].mean()) if "cadence" in sub_df.columns and not sub_df["cadence"].isna().all() else 0.0
     frac_cad = float(sub_df["fractional_cadence"].mean()) if "fractional_cadence" in sub_df.columns and not sub_df["fractional_cadence"].isna().all() else 0.0
     max_cad = float(sub_df["cadence"].max()) if "cadence" in sub_df.columns and not sub_df["cadence"].isna().all() else 0.0
 
-    # パワー & NP
+    # Power & Coggan Normalized Power (NP)
     avg_pow = round_half_up(sub_df["power"].mean()) if "power" in sub_df.columns and not sub_df["power"].isna().all() else None
     max_pow = int(sub_df["power"].max()) if "power" in sub_df.columns and not sub_df["power"].isna().all() else None
     if "power" in sub_df.columns and not sub_df["power"].isna().all():
@@ -330,16 +331,16 @@ def synthesize_lap_from_records(
     else:
         calc_np = None
 
-    # 接地時間・バランス
+    # Ground Contact Time & Balance
     avg_gct = float(sub_df["stance_time"].mean()) if "stance_time" in sub_df.columns and not sub_df["stance_time"].isna().all() else None
     avg_bal = float(sub_df["stance_time_balance"].mean()) if "stance_time_balance" in sub_df.columns and not sub_df["stance_time_balance"].isna().all() else None
 
-    # 上下動・比率・歩幅
+    # Vertical Oscillation, Ratio, & Stride Length
     avg_vo = float(sub_df["vertical_oscillation"].mean()) if "vertical_oscillation" in sub_df.columns and not sub_df["vertical_oscillation"].isna().all() else None
     avg_vr = float(sub_df["vertical_ratio"].mean()) if "vertical_ratio" in sub_df.columns and not sub_df["vertical_ratio"].isna().all() else None
     avg_sl = float(sub_df["step_length"].mean()) if "step_length" in sub_df.columns and not sub_df["step_length"].isna().all() else None
 
-    # 標高（上昇/下降）
+    # Elevation (Ascent / Descent)
     st = sub_df["timestamp"].iloc[0]
     et = sub_df["timestamp"].iloc[-1]
     if smooth_alt_arr is not None and not df_rec.empty:
@@ -356,10 +357,10 @@ def synthesize_lap_from_records(
         asc = 0
         desc = 0
 
-    # カロリー比例按分
+    # Proportionally scaled calories
     cal = round_half_up(group_calories * (timer_time / group_timer_time)) if group_timer_time > 0 else 0
 
-    # 最新SSL（146, 147 -> 164, 165）
+    # Step Speed Loss (fields 146, 147 -> 164, 165)
     ssl_164 = round_half_up(sub_df[146].mean()) if 146 in sub_df.columns and not sub_df[146].isna().all() else None
     ssl_165 = round_half_up(sub_df[147].mean()) if 147 in sub_df.columns and not sub_df[147].isna().all() else None
 
@@ -417,47 +418,47 @@ TYPE_MAPPING = {
 
 REVERSE_TYPE_MAPPING = {v: k for k, v in TYPE_MAPPING.items()}
 
-# Garmin最新メトリクス（Step Speed Loss）の各メッセージ種別におけるフィールドID定義
+# Field ID mappings for Garmin Running Dynamics (Step Speed Loss) across message types
 CUSTOM_FIELD_MAPPINGS: Dict[str, Dict[int, str]] = {
     "record": {
-        146: "step_speed_loss",        # 単位: cm/s (val / 100.0)
-        147: "step_speed_loss_percent",# 単位: % (val / 100.0)
+        146: "step_speed_loss",        # Unit: cm/s (val / 100.0)
+        147: "step_speed_loss_percent",# Unit: % (val / 100.0)
     },
     "lap": {
-        164: "avg_step_speed_loss",        # 単位: cm/s (val / 100.0)
-        165: "avg_step_speed_loss_percent",# 単位: % (val / 100.0)
+        164: "avg_step_speed_loss",        # Unit: cm/s (val / 100.0)
+        165: "avg_step_speed_loss_percent",# Unit: % (val / 100.0)
     },
     "split": {
-        130: "avg_step_speed_loss",        # 単位: cm/s (val / 100.0)
-        131: "avg_step_speed_loss_percent",# 単位: % (val / 100.0)
+        130: "avg_step_speed_loss",        # Unit: cm/s (val / 100.0)
+        131: "avg_step_speed_loss_percent",# Unit: % (val / 100.0)
     },
     "session": {
-        222: "avg_step_speed_loss",        # 単位: cm/s (val / 100.0)
-        223: "avg_step_speed_loss_percent",# 単位: % (val / 100.0)
+        222: "avg_step_speed_loss",        # Unit: cm/s (val / 100.0)
+        223: "avg_step_speed_loss_percent",# Unit: % (val / 100.0)
     }
 }
 
 
-# --- データ解析処理 ---
+# --- FIT Data Decoding ---
 
 def parse_fit_file(fit_path: str) -> Dict[str, List[Dict[str, Any]]]:
-    """FITファイルを解析し、メッセージ種別ごとの辞書リストを返す"""
+    """Decode a FIT file and return a dictionary of message lists by type."""
     stream = Stream.from_file(fit_path)
     decoder = Decoder(stream)
     messages, errors = decoder.read()
     if errors:
-        print(f"  [情報] パース中の警告/エラー: {len(errors)} 件", file=sys.stderr)
+        print(f"  [Info] Parsing warnings/errors: {len(errors)}", file=sys.stderr)
     return messages
 
 
-# --- Garmin Connect 準拠モードの生成 ---
+# --- Garmin Connect Conforming Mode Builder ---
 
 def generate_connect_dataframe(
     messages: Dict[str, List[Dict[str, Any]]],
     user_weight: Optional[float] = None,
     re_lap_distance: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Garmin ConnectのラップエクスポートCSV（案A構造）と同一のDataFrameを生成"""
+    """Generate a DataFrame conforming to Garmin Connect export CSV schema (Proposal A)."""
     laps = messages.get("lap_mesgs", [])
     if not laps:
         return pd.DataFrame()
@@ -470,17 +471,17 @@ def generate_connect_dataframe(
     if weight is None and "user_profile_mesgs" in messages and messages["user_profile_mesgs"]:
         weight = messages["user_profile_mesgs"][0].get("weight")
 
-    # GAP計算用の時系列標高平滑化
+    # Timeseries elevation smoothing for GAP estimation
     records = messages.get("record_mesgs", [])
     df_rec = pd.DataFrame(records) if records else pd.DataFrame()
     smooth_alt_arr = None
     if not df_rec.empty and "distance" in df_rec.columns:
         alt_col = "enhanced_altitude" if "enhanced_altitude" in df_rec.columns else ("altitude" if "altitude" in df_rec.columns else None)
         if alt_col and not df_rec[alt_col].isna().all():
-            # 21秒移動平均でランナーの腕振り振動ノイズを除去
+            # 21-second rolling average to filter gait vibration noise
             smooth_alt_arr = df_rec[alt_col].rolling(21, center=True, min_periods=1).mean().values
 
-    # 同一ワークアウトステップ（オートラップ分割含む）のグループ化
+    # Group laps belonging to the same workout step (including auto-lap partitions)
     groups = []
     curr = []
     for i, l in enumerate(laps):
@@ -510,7 +511,7 @@ def generate_connect_dataframe(
         step_type = INTENSITY_TO_STEP_TYPE.get(inte, str(inte).capitalize() if inte else "")
         is_active = (inte == "active")
 
-        # 再計算（re-lap）判定
+        # Evaluate re-lap condition
         g_dist = sum(x[1].get("total_distance", 0) for x in g)
         has_distance_laps = any(x[1].get("lap_trigger") == "distance" for x in g)
         should_relap = bool(
@@ -557,9 +558,9 @@ def generate_connect_dataframe(
         else:
             laps_for_group = [x[1] for x in g]
 
-        # 行の生成
+        # Row generation
         if len(laps_for_group) > 1:
-            # 親ステップ行を出力
+            # Emit parent step row
             first_lap_num = lap_counter
             last_lap_num = lap_counter + len(laps_for_group) - 1
             lap_range = f"{first_lap_num} - {last_lap_num}"
@@ -595,7 +596,7 @@ def generate_connect_dataframe(
             p_ssl = f"{round_half_up(split_data.get(130)/100.0, 1):.1f}" if (split_data and split_data.get(130) is not None) else (f"{round_half_up(np.mean([x.get(164) for x in laps_for_group if x.get(164) is not None])/100.0, 1):.1f}" if any(x.get(164) is not None for x in laps_for_group) else "")
             p_ssl_pct = f"{round_half_up(split_data.get(131)/100.0, 2):.2f}" if (split_data and split_data.get(131) is not None) else (f"{round_half_up(np.mean([x.get(165) for x in laps_for_group if x.get(165) is not None])/100.0, 2):.2f}" if any(x.get(165) is not None for x in laps_for_group) else "")
 
-            # 親ステップ区間の Avg GAP 計算
+            # Calculate parent step Avg GAP
             p_st = laps_for_group[0].get("start_time")
             p_et = laps_for_group[-1].get("start_time") + pd.Timedelta(seconds=laps_for_group[-1].get("total_timer_time", 0)) if laps_for_group[-1].get("start_time") else None
             p_gap = calculate_segment_gap_pace(df_rec, smooth_alt_arr, p_st, p_et) if p_st and p_et else ""
@@ -634,7 +635,7 @@ def generate_connect_dataframe(
                 "Avg Step Speed Loss (%)": p_ssl_pct,
             })
 
-            # 配下の子ラップ行を展開
+            # Expand child lap rows
             for l in laps_for_group:
                 current_lap_num = lap_counter
                 lap_counter += 1
@@ -702,7 +703,7 @@ def generate_connect_dataframe(
                     "Avg Step Speed Loss (%)": l_ssl_pct,
                 })
         else:
-            # 単一ラップのステップ
+            # Standalone single-lap step
             l = laps_for_group[0]
             current_lap_num = lap_counter
             lap_counter += 1
@@ -773,7 +774,7 @@ def generate_connect_dataframe(
                 "Avg Step Speed Loss (%)": l_ssl_pct,
             })
 
-    # 最下部: Summary 行
+    # Bottom: Summary row
     s_time = sess.get("total_timer_time")
     s_dist = sess.get("total_distance", 0)
     s_sp = sess.get("enhanced_avg_speed") or sess.get("avg_speed")
@@ -799,7 +800,7 @@ def generate_connect_dataframe(
     s_ssl = f"{round_half_up(sess.get(222)/100.0, 1):.1f}" if sess.get(222) is not None else ""
     s_ssl_pct = f"{round_half_up(sess.get(223)/100.0, 2):.2f}" if sess.get(223) is not None else ""
 
-    # 全体サマリの Avg GAP
+    # Overall Summary Avg GAP
     sum_st = laps[0].get("start_time") if laps else None
     sum_et = laps[-1].get("start_time") + pd.Timedelta(seconds=laps[-1].get("total_timer_time", 0)) if laps and laps[-1].get("start_time") else None
     s_gap = calculate_segment_gap_pace(df_rec, smooth_alt_arr, sum_st, sum_et) if sum_st and sum_et else ""
@@ -842,14 +843,14 @@ def generate_connect_dataframe(
     return pd.DataFrame(rows)
 
 
-# --- FIT生データ抽出モードの生成 ---
+# --- Raw FIT Data Extraction Mode Builder ---
 
 def extract_raw_dataframe(
     records: List[Dict[str, Any]],
     message_name: str,
     include_unknown: bool = False,
 ) -> pd.DataFrame:
-    """FITメッセージから余分な加工列を排した純粋な生データDataFrameを作成"""
+    """Create a clean raw DataFrame from FIT messages without human-oriented formatting."""
     rows = []
     clean_msg = message_name.replace("_mesgs", "")
     known_id_map = CUSTOM_FIELD_MAPPINGS.get(clean_msg, {})
@@ -857,7 +858,7 @@ def extract_raw_dataframe(
     for record in records:
         row: Dict[str, Any] = {}
         for key, val in record.items():
-            # カスタムマッピング対象（SSL）の既知IDかチェック
+            # Check if field is a known custom mapping ID (Step Speed Loss)
             if isinstance(key, int) and key in known_id_map:
                 str_key = known_id_map[key]
                 if is_valid_num(val):
@@ -868,14 +869,14 @@ def extract_raw_dataframe(
                     continue
                 str_key = f"unknown_{key}" if isinstance(key, int) else str(key)
 
-            # タプル/リストの整形
+            # Format tuples / lists
             if isinstance(val, (tuple, list)):
                 if all(v is None for v in val):
                     val = None
                 else:
                     val = "/".join(str(v) if v is not None else "-" for v in val)
 
-            # datetime のタイムゾーン文字列化（ISO形式）
+            # Format datetime to string (ISO format)
             if isinstance(val, datetime):
                 val = val.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -889,7 +890,7 @@ def extract_raw_dataframe(
 
     df = pd.DataFrame(rows)
 
-    # 緯度経度の実用的な度数変換列のみ付加
+    # Add practical decimal degree conversions for coordinates
     lat_mappings = {
         "position_lat": "latitude",
         "start_position_lat": "start_latitude",
@@ -916,12 +917,12 @@ def extract_raw_dataframe(
 
 
 def list_fit_messages(fit_path: str):
-    """FITファイルに含まれるメッセージ種別とそのレコード数を一覧表示"""
-    print(f"\n[ファイル構造] {fit_path}")
+    """Display a summary list of message types and record counts in a FIT file."""
+    print(f"\n[File Structure] {fit_path}")
     messages = parse_fit_file(fit_path)
 
     print("-" * 45)
-    print(f"{'メッセージ種別':<30} | {'件数':>10}")
+    print(f"{'Message Type':<30} | {'Count':>10}")
     print("-" * 45)
     for name, items in sorted(messages.items(), key=lambda x: len(x[1]), reverse=True):
         display_name = REVERSE_TYPE_MAPPING.get(name, name.replace("_mesgs", ""))
@@ -930,7 +931,7 @@ def list_fit_messages(fit_path: str):
 
 
 def extract_workout_name(messages: Dict[str, Any]) -> Optional[str]:
-    """FITメッセージからワークアウト名（wkt_name）を抽出"""
+    """Extract workout name (wkt_name) from FIT messages."""
     wkts = messages.get("workout_mesgs", [])
     if not wkts:
         return None
@@ -951,23 +952,24 @@ def extract_workout_name(messages: Dict[str, Any]) -> Optional[str]:
 
 def sanitize_filename(name: str) -> str:
     """
-    ファイル名として使用できるように文字列をサニタイズ
-    - 空白文字（半角・全角スペース、タブ等）を除去
-    - ファイル名に使用できない文字 (\\, /, :, *, ?, ", <, >, |, 制御文字) を除去
+    Sanitize a string for safe use as a filename:
+    - Remove whitespace characters (spaces, tabs, full-width spaces).
+    - Remove invalid filename characters (\\, /, :, *, ?, ", <, >, |, and control chars).
+    - Strip leading and trailing periods.
     """
     if not name:
         return ""
-    # 空白文字を除去
+    # Remove whitespace
     s = re.sub(r'[\s\u3000]+', '', name)
-    # ファイル名禁止文字・制御文字を除去
+    # Remove forbidden filename characters and control characters
     s = re.sub(r'[\\/*?:"<>|\x00-\x1f\x7f]', '', s)
-    # 先頭・末尾のピリオドを除去
+    # Strip leading/trailing dots
     return s.strip('.')
 
 
 def extract_activity_date(messages: Dict[str, Any]) -> Optional[str]:
-    """FITメッセージからアクティビティ実施日（YYYY-MM-DD）を抽出（ローカル時刻優先）"""
-    # 1. activity_mesgs の local_timestamp (ローカル秒)
+    """Extract activity date (YYYY-MM-DD) from FIT messages (local time prioritized)."""
+    # 1. activity_mesgs local_timestamp (local seconds)
     acts = messages.get("activity_mesgs", [])
     if acts:
         local_ts = acts[0].get("local_timestamp")
@@ -977,7 +979,7 @@ def extract_activity_date(messages: Dict[str, Any]) -> Optional[str]:
             local_dt = fit_epoch + timedelta(seconds=int(local_ts))
             return local_dt.strftime("%Y-%m-%d")
 
-    # 2. session_mesgs の start_time (UTC datetime)
+    # 2. session_mesgs start_time (UTC datetime)
     sess = messages.get("session_mesgs", [])
     if sess and sess[0].get("start_time"):
         st = sess[0].get("start_time")
@@ -987,7 +989,7 @@ def extract_activity_date(messages: Dict[str, Any]) -> Optional[str]:
             except Exception:
                 return st.strftime("%Y-%m-%d")
 
-    # 3. activity_mesgs の timestamp
+    # 3. activity_mesgs timestamp
     if acts and acts[0].get("timestamp"):
         ts = acts[0].get("timestamp")
         if isinstance(ts, datetime):
@@ -1008,16 +1010,16 @@ def convert_fit(
     use_workout_name: bool = False,
     re_lap_distance: Optional[float] = None,
 ) -> List[str]:
-    """単一のFITファイルを指定されたモードでCSVに変換"""
+    """Convert a single FIT file to CSV according to specified options."""
     if not os.path.exists(fit_path):
-        print(f"エラー: 指定されたファイルが見つかりません: {fit_path}", file=sys.stderr)
+        print(f"Error: Specified file not found: {fit_path}", file=sys.stderr)
         return []
 
-    print(f"\n処理中: {fit_path}")
+    print(f"\nProcessing: {fit_path}")
     try:
         messages = parse_fit_file(fit_path)
     except Exception as e:
-        print(f"エラー: FITファイルの解析に失敗しました ({fit_path}): {e}", file=sys.stderr)
+        print(f"Error: Failed to parse FIT file ({fit_path}): {e}", file=sys.stderr)
         return []
 
     base_name = os.path.splitext(os.path.basename(fit_path))[0]
@@ -1029,14 +1031,14 @@ def convert_fit(
             if clean_wkt:
                 if act_date:
                     base_name = f"{clean_wkt}_{act_date}"
-                    print(f"  [ワークアウト名] '{wkt}' (日付: {act_date}) -> ファイル名ベース: '{base_name}'")
+                    print(f"  [Workout Name] '{wkt}' (Date: {act_date}) -> Filename base: '{base_name}'")
                 else:
                     base_name = clean_wkt
-                    print(f"  [ワークアウト名] '{wkt}' -> ファイル名ベース: '{base_name}'")
+                    print(f"  [Workout Name] '{wkt}' -> Filename base: '{base_name}'")
             else:
-                print(f"  [警告] ワークアウト名 '{wkt}' のサニタイズ結果が空文字となったため、元のファイル名を使用します。")
+                print(f"  [Warning] Sanitized workout name '{wkt}' resulted in an empty string. Using original filename.", file=sys.stderr)
         else:
-            print("  [情報] ワークアウト名が記録されていないため、元のファイル名を使用します。")
+            print("  [Info] No workout name recorded. Using original filename.")
 
     out_dir = os.path.dirname(output_path) if output_path and os.path.dirname(output_path) else os.path.dirname(fit_path)
     if not out_dir:
@@ -1044,7 +1046,7 @@ def convert_fit(
 
     created_files = []
 
-    # 1. Garmin Connect モード
+    # 1. Garmin Connect Mode
     if "connect" in target_types:
         df_connect = generate_connect_dataframe(
             messages,
@@ -1055,11 +1057,11 @@ def convert_fit(
             csv_path = output_path if (output_path and len(target_types) == 1) else os.path.join(out_dir, f"{base_name}_connect.csv")
             df_connect.to_csv(csv_path, index=False, encoding="utf-8-sig")
             created_files.append(csv_path)
-            print(f"  ✓ [connect] -> {csv_path} ({len(df_connect)} 行, {len(df_connect.columns)} 列)")
+            print(f"  ✓ [connect] -> {csv_path} ({len(df_connect)} rows, {len(df_connect.columns)} cols)")
         else:
-            print("  - [connect] ラップデータが存在しないためスキップしました。")
+            print("  - [connect] Skipped: No lap data present.")
 
-    # 2. 生データ抽出モード
+    # 2. Raw Data Extraction Mode
     raw_types = [t for t in target_types if t != "connect"]
     if raw_types:
         if "all" in raw_types:
@@ -1083,7 +1085,7 @@ def convert_fit(
             records = messages.get(key, [])
 
             if not records:
-                print(f"  - [{clean_name}] データが存在しないためスキップしました。")
+                print(f"  - [{clean_name}] Skipped: No data present.")
                 continue
 
             df = extract_raw_dataframe(
@@ -1102,104 +1104,104 @@ def convert_fit(
 
             df.to_csv(csv_path, index=False, encoding="utf-8-sig")
             created_files.append(csv_path)
-            print(f"  ✓ [{clean_name}] -> {csv_path} ({len(df)} 行, {len(df.columns)} 列)")
+            print(f"  ✓ [{clean_name}] -> {csv_path} ({len(df)} rows, {len(df.columns)} cols)")
 
     return created_files
 
 
-# --- メイン処理 / CLI ---
+# --- Main Entry Point / CLI ---
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GARMIN FITファイルをCSVファイルに変換します。（Garmin Official SDK使用）",
+        description="Converts GARMIN FIT files to CSV format using Garmin's official SDK.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-使用例:
-  # Garmin Connect準拠のCSVを出力 (デフォルト: <ファイル名>_connect.csv)
+Examples:
+  # Export Garmin Connect conforming CSV (Default: <filename>_connect.csv)
   python fit2csv.py activity.fit
 
-  # 体重を指定してGarmin Connect準拠のCSVを出力 (W/kg計算用)
+  # Export Garmin Connect CSV with weight override for W/kg
   python fit2csv.py activity.fit -w 57.9
 
-  # 出力ファイル名を指定
+  # Specify output destination
   python fit2csv.py activity.fit -o my_workout.csv
 
-  # ワークアウト名をファイル名に使用して変換
+  # Use workout name and date as output filename
   python fit2csv.py activity.fit -n
 
-  # 自動ラップ区間を2km（2000m）間隔で再計算してGarmin Connect形式CSVを出力
+  # Re-lap auto-lap intervals by 2km (2000m)
   python fit2csv.py activity.fit --re-lap 2km
   python fit2csv.py activity.fit --re-lap 2000
 
-  # 自動ラップ区間を500m間隔で再計算して出力
+  # Re-lap into 500m blocks
   python fit2csv.py activity.fit --re-lap 500m
 
-  # 秒単位の時系列生レコード (record) をCSVに出力
+  # Export raw 1-second timeseries records
   python fit2csv.py activity.fit --type record
 
-  # ラップ生データ (lap) をCSVに出力
+  # Export raw lap messages
   python fit2csv.py activity.fit --type lap
 
-  # 生データ (record, lap, split, session) を全て別々のCSVに出力
+  # Export all raw message tables into separate CSV files
   python fit2csv.py activity.fit --type all
 
-  # フォルダ内の全FITファイルを一括変換
+  # Batch convert all FIT files in current folder
   python fit2csv.py *.fit
 
-  # FITファイルに含まれるメッセージ種別を確認
+  # Inspect message types and record counts
   python fit2csv.py activity.fit --list
 """
     )
     parser.add_argument(
         "files",
         nargs="+",
-        help="変換対象のFITファイルパス（ワイルドカード指定可）"
+        help="Target FIT file path(s) (wildcards supported)"
     )
     parser.add_argument(
         "-t", "--type",
         dest="types",
         default=["connect"],
         nargs="+",
-        help="抽出するデータ種別: connect (デフォルト), record, lap, split, session, activity, all 等"
+        help="Data type(s) to export: connect (default), record, lap, split, session, activity, all, etc."
     )
     parser.add_argument(
         "-n", "--workout-name",
         action="store_true",
-        help="FITファイル名ではなくワークアウト名と実施日（YYYY-MM-DD）をCSVファイル名に使用する（空白および無効文字は除去）"
+        help="Use workout name and date (YYYY-MM-DD) instead of FIT filename for output CSV"
     )
     parser.add_argument(
         "-o", "--output",
         dest="output",
         default=None,
-        help="出力先CSVファイルパス（1ファイル・1種別変換時のみ有効）"
+        help="Output CSV destination path (valid when converting a single file to a single type)"
     )
     parser.add_argument(
         "--include-unknown",
         action="store_true",
-        help="生データ抽出時にFIT内部の未知フィールド(unknown_*)も含める"
+        help="Retain raw unmapped FIT fields (unknown_*) in raw extraction mode"
     )
     parser.add_argument(
         "-w", "--weight",
         type=float,
         default=None,
-        help="ユーザー体重(kg)を指定（FIT内部の登録体重を上書きしてW/kgを計算）"
+        help="Specify athlete body weight in kg (overrides FIT profile weight for W/kg calculations)"
     )
     parser.add_argument(
         "--re-lap",
         dest="re_lap",
         type=parse_distance_argument,
         default=None,
-        help="Garmin Connect出力時、自動ラップ区間を指定した一定距離で再計算する（例: 2000, 2km, 500m）"
+        help="Re-aggregate auto-lap intervals by specified distance in Connect mode (e.g. 2000, 2km, 500m)"
     )
     parser.add_argument(
         "-l", "--list",
         action="store_true",
-        help="変換を行わず、FITファイルに含まれるメッセージ種別一覧を表示する"
+        help="List all message types and record counts in FIT file without converting"
     )
 
     args = parser.parse_args()
 
-    # ワイルドカードの展開
+    # Expand wildcards
     target_files = []
     for pattern in args.files:
         matched = glob.glob(pattern)
@@ -1208,11 +1210,11 @@ def main():
         else:
             target_files.append(pattern)
 
-    # 重複排除
+    # Deduplicate files
     target_files = sorted(list(dict.fromkeys(target_files)))
 
     if not target_files:
-        print("エラー: 処理対象のファイルが見つかりません。", file=sys.stderr)
+        print("Error: No matching files found.", file=sys.stderr)
         sys.exit(1)
 
     if args.list:
@@ -1220,9 +1222,9 @@ def main():
             list_fit_messages(f)
         return
 
-    # 単一出力先が指定されているのに複数ファイルまたは複数タイプが指定されている場合の警告
+    # Warn if custom output path is given for multiple files or multiple types
     if args.output and (len(target_files) > 1 or len(args.types) > 1 and "all" not in args.types):
-        print("警告: 複数ファイルまたは複数種別の処理時、-o/--output は無視され、自動ファイル名が使用されます。", file=sys.stderr)
+        print("Warning: When processing multiple files or types, -o/--output is ignored and auto-naming is used.", file=sys.stderr)
         args.output = None
 
     all_created = []
@@ -1238,7 +1240,7 @@ def main():
         )
         all_created.extend(created)
 
-    print(f"\n変換完了: 合計 {len(all_created)} 個のCSVファイルを出力しました。")
+    print(f"\nConversion complete: Generated {len(all_created)} CSV file(s).")
 
 
 if __name__ == "__main__":
