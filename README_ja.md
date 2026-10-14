@@ -39,13 +39,18 @@ FITバイナリから抽出されたメッセージを、余計な加工列を�
 
 ## 🚀 使い方
 
-### 1. 準備 (仮想環境の有効化)
+### 1. 準備 (環境構築)
 ```bash
-# 仮想環境をアクティベート
-source .venv/bin/activate
+# リポジトリのクローン
+git clone https://github.com/dangan-dev/fit2csv.git
+cd fit2csv
 
-# (初回のみ) 必要なパッケージのインストール
-pip install garmin-fit-sdk pandas
+# 仮想環境の作成とアクティベート
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# 依存パッケージのインストール
+pip install -r requirements.txt
 ```
 
 ### 2. コマンド実行例

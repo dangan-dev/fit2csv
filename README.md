@@ -53,7 +53,7 @@ Extracts the workout title and activity start date directly from the FIT file me
 ### Setup
 ```bash
 # Clone repository
-git clone https://github.com/<username>/fit2csv.git
+git clone https://github.com/dangan-dev/fit2csv.git
 cd fit2csv
 
 # Create and activate virtual environment
