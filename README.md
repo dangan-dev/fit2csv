@@ -1,124 +1,157 @@
-# Garmin FIT to CSV 変換ツール (`fit2csv.py`)
+# Garmin FIT to CSV Converter (`fit2csv.py`)
 
-Garmin公式の **`garmin-fit-sdk`** を使用して、GARMINデバイスが出力する `.fit` バイナリファイルを解析し、扱いやすい CSV 形式で出力するPythonスクリプトです。
+**English** | [日本語](README_ja.md)
 
----
-
-## 🛠 特徴
-
-### 1. Garmin Connect 準拠モード（デフォルト）
-`python fit2csv.py activity.fit` のようにオプションなしで実行すると、Garmin Connect ウェブサイトからエクスポートしたCSVと同一のフォーマットで `<ファイル名>_connect.csv` を生成します。
-- **ワークアウト階層構造の再現（案A）**:
-  - 1kmオートラップ等で複数ラップに分割された同一ワークアウトステップは、親ステップ行（例: `Lap: 1 - 2`, `Lap: 1 - 9`）を先行出力し、その配下に子ラップ行を展開。
-  - 単一ラップのステップはそのまま1行で出力。
-  - 最下行にアクティビティ全体のサマリ行（`Interval: Summary`, `Step Type: --`, `Lap: --`）を付与。
-- **最新ランニングダイナミクス対応 (HRM-600等)**:
-  - **`Avg Step Speed Loss (cm/s)`**: 接地時の減速・ブレーキ量（cm/s）
-  - **`Avg Step Speed Loss (%)`**: 走速度に対する減速損失比率（%）
-- **高精度な表示整合性**:
-  - **`Avg GAP` (Grade Adjusted Pace / 勾配調整ペース)**: 気圧高度計データ (`enhanced_altitude`) に対するノイズフィルタ処理と Minetti (2002) の生体力学エネルギー消費モデルに基づく推定により、Garmin Connect の Web GAP と秒単位（0〜2秒差）で整合。
-  - 四捨五入（算術丸め）、M:SS形式ペース、W/kg（`-w/--weight` による体重上書き対応）、GCT Balance（`XX.X% L / YY.Y% R`）など、Garmin Connectの表示仕様と99%以上の完全一致を達成。
-- **自動ラップ区間の任意間隔再計算 (`--re-lap`)**:
-  - ウォッチの自動ラップ設定（通常1km）で記録されたデータを、ユーザーが指定した任意の間隔（例: `2000`, `2km`, `500m`）で再集計して出力可能。
-  - ワークアウトのステップ構造（WS疾走/レストやインターバルの境界）を破壊せず、1秒ごとの時系列データ（`record`）から全31項目（心拍、パワー、Coggan NP、100.0%保証GCT Balance、上下動、歩幅、標高差、Step Speed Loss、Avg GAP等）を高精度に集約・再生成。
-  - 端数ラップ（割り切れない余り区間）も末尾に保持。単位付き表記（`km`, `m`）および数値指定の両方に対応。
-
-### 2. FIT 生データ抽出モード（`--type record`, `lap`, `split`, `session`, `all`）
-FITバイナリから抽出されたメッセージを、余計な加工列を排した純粋なテーブル形式で出力します。
-- `record`: 1秒ごとの時系列データ
-- `lap`: ラップごとの生データ
-- `split`: ウォーク/ラン検知やインターバルステップごとのスプリットデータ
-- `session`: セッション概要生データ
-- `all`: FITファイルに含まれる全メッセージを個別CSVに出力
-- 未定義フィールドだった Step Speed Loss (`step_speed_loss`, `step_speed_loss_percent`) は適切な単位（cm/s, %）に正規化。
-- 緯度経度は扱いやすい度数（degrees）に変換。
+A high-fidelity Python tool leveraging Garmin's official **`garmin-fit-sdk`** to decode Garmin `.fit` binary activity files and export clean, structured, and highly accurate CSV data.
 
 ---
 
-## 🚀 使い方
+## 🛠 Key Features
 
-### 1. 準備 (仮想環境の有効化)
+### 1. Garmin Connect Conforming Mode (Default)
+Running without options (`python fit2csv.py activity.fit`) generates `<filename>_connect.csv`, mirroring the exact schema, column headers, formatting rules, and row hierarchies produced by the Garmin Connect web export.
+
+- **Workout Step Hierarchy Reconstruction**:
+  - Automatically groups multi-lap segments split by auto-lap (e.g., 1km auto-laps during a 5km tempo run or long warmup).
+  - Emits parent interval header rows (e.g., `Lap: 1 - 2`, `Lap: 1 - 9`) followed by indented child lap rows.
+  - Retains single-lap steps as standalone rows without distortion.
+  - Appends an activity-wide summary row at the bottom (`Interval: Summary`, `Step Type: --`, `Lap: --`).
+- **Advanced Running Dynamics (HRM-600 / Running Dynamics Pod Support)**:
+  - **`Avg Step Speed Loss (cm/s)`**: Ground braking deceleration per step.
+  - **`Avg Step Speed Loss (%)`**: Deceleration speed loss ratio relative to running velocity.
+- **High-Fidelity Display & Calculations**:
+  - **`Avg GAP` (Grade Adjusted Pace)**: Combines 21-second moving-average smoothing on barometric elevation (`enhanced_altitude`) with the **Minetti (2002) biomechanical energy cost model** to estimate flat-equivalent pace, aligning with Garmin Connect web GAP within seconds (0–2s variance).
+  - **100.0% Guaranteed Ground Contact Time Balance**: Derives right-foot balance from the measured left-foot percentage ($L\% + R\% \equiv 100.0\%$), eliminating rounding artifacts present in native Garmin exports (e.g. `49.8% L / 50.3% R`).
+  - Strict arithmetic half-up rounding, `M:SS` pace representations, and custom user weight overrides (`-w / --weight`) for W/kg power calculations.
+- **Arbitrary Interval Re-Lap Recalculation (`--re-lap`)**:
+  - Re-aggregates activities recorded under default auto-lap settings (e.g., 1km) into custom target distances (e.g., `2000`, `2km`, `500m`).
+  - **Preserves workout step boundaries**: Protects warmup, cooldown, and interval sprint/recovery segments from being broken.
+  - Recomputes all 31 key performance metrics from 1Hz timeseries records (`record`), including HR, Power, Coggan Normalized Power (NP), Cadence, Vertical Oscillation, Stride Length, Step Speed Loss, and GAP.
+  - Automatically handles fractional leftover distances at the end of segments.
+
+### 2. Raw FIT Data Extraction Mode (`--type record`, `lap`, `split`, `session`, `all`)
+Extracts clean, unformatted raw data tables directly from FIT binary messages, stripping UI-centric formatting strings while preserving analytical purity:
+- `record`: 1-second timeseries records.
+- `lap`: Native lap summary messages.
+- `split`: Interval steps and auto-detected walk/run splits.
+- `session`: Overall session summary metadata.
+- `all`: Exports every present message type into individual CSV files.
+- Automatically normalizes vendor-specific Step Speed Loss fields to standard physical units (`cm/s`, `%`) and converts semicircles to decimal degrees (`latitude`, `longitude`).
+
+### 3. Smart Output Naming (`-n / --workout-name`)
+Extracts the workout title and activity start date directly from the FIT file metadata to generate structured filenames:
+- Output format: `{WorkoutName}_{Date}_{type}.csv` (e.g., `[W8]Intervals(1kmx5)_2026-10-06_connect.csv`).
+- Sanitizes whitespace and filesystem-reserved characters (`\ / : * ? " < > |`) automatically.
+
+---
+
+## 🚀 Installation & Prerequisites
+
+### Prerequisites
+- Python 3.9 or higher
+
+### Setup
 ```bash
-# 仮想環境をアクティベート
-source .venv/bin/activate
+# Clone repository
+git clone https://github.com/<username>/fit2csv.git
+cd fit2csv
 
-# (初回のみ) 必要なパッケージのインストール
-pip install garmin-fit-sdk pandas
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install required packages
+pip install -r requirements.txt
 ```
 
-### 2. コマンド実行例
+---
 
-#### ① Garmin Connect準拠のCSVを出力（デフォルト）
+## 📖 Usage Examples
+
+### 1. Standard Garmin Connect CSV Export (Default)
 ```bash
 python fit2csv.py 24109883492_ACTIVITY.fit
-# 出力: 24109883492_ACTIVITY_connect.csv
+# Generates: 24109883492_ACTIVITY_connect.csv
 ```
 
-#### ② 体重を指定してGarmin Connect準拠のCSVを出力（W/kg計算用）
+### 2. Override Weight for W/kg Power Calculations
 ```bash
-python fit2csv.py 24109883492_ACTIVITY.fit -w 57.9
+python fit2csv.py 24109883492_ACTIVITY.fit -w 60.5
 ```
 
-#### ③ ラップ生データ (lap) をCSV出力
-```bash
-python fit2csv.py 24109883492_ACTIVITY.fit --type lap
-# 出力: 24109883492_ACTIVITY_lap.csv
-```
-
-#### ④ 秒単位の時系列生データ (record) をCSV出力
+### 3. Extract Raw 1-Second Timeseries Records
 ```bash
 python fit2csv.py 24109883492_ACTIVITY.fit --type record
-# 出力: 24109883492_ACTIVITY_record.csv
+# Generates: 24109883492_ACTIVITY_record.csv
 ```
 
-#### ⑤ 全てのFITメッセージを生データとして一括出力
+### 4. Extract Raw Lap Messages
+```bash
+python fit2csv.py 24109883492_ACTIVITY.fit --type lap
+# Generates: 24109883492_ACTIVITY_lap.csv
+```
+
+### 5. Export All FIT Message Tables
 ```bash
 python fit2csv.py 24109883492_ACTIVITY.fit --type all
 ```
 
-#### ⑥ ワークアウト名と実施日をファイル名に使用して変換
+### 6. Auto-Name with Workout Title & Date
 ```bash
 python fit2csv.py 24627552877_ACTIVITY.fit -n
-# 出力形式: {ワークアウト名}_{日付}_{タイプ}.csv
-# 出力例: [W8]Intervals(1kmx5425-_2026-10-06_connect.csv
-# （空白およびファイル名に使用できない文字 \ / : * ? " < > | は自動除去されます）
+# Generates: [W8]Intervals(1kmx5425-_2026-10-06_connect.csv
 ```
 
-#### ⑦ 自動ラップ区間を任意距離（例: 2km, 500m）で再計算して出力
+### 7. Re-Aggregate Auto-Laps into Custom Distances
 ```bash
-# 2km間隔で再計算
+# Resample auto-laps into 2km blocks
 python fit2csv.py 24651552170_ACTIVITY.fit --re-lap 2km
-# （または --re-lap 2000）
 
-# 500m間隔で細分化再計算
+# Resample into 500m blocks
 python fit2csv.py 24651552170_ACTIVITY.fit --re-lap 500m
 ```
 
-#### ⑧ 出力ファイル名を直接指定する場合
-```bash
-python fit2csv.py sample.fit -o my_workout.csv
-```
-
-#### ⑨ フォルダ内の全FITファイルを一括変換
+### 8. Batch Convert Multiple FIT Files
 ```bash
 python fit2csv.py *.fit
 ```
 
-#### ⑩ FITファイルに含まれるデータ種別（メッセージ一覧）を確認
+### 9. Inspect Available Message Types in a FIT File
 ```bash
 python fit2csv.py sample.fit --list
 ```
 
 ---
 
-## 📊 オプション一覧
+## ⚙️ CLI Options Reference
 
-| オプション | 説明 |
+| Option | Description |
 |---|---|
-| `-t, --type <TYPE...>` | 出力種別を指定 (`connect` (デフォルト), `record`, `lap`, `split`, `session`, `activity`, `all` 等) |
-| `--re-lap <DIST>` | Garmin Connect出力時、自動ラップ区間を指定した一定距離で再計算（例: `2000`, `2km`, `500m`） |
-| `-n, --workout-name` | 出力ファイル名にワークアウト名と実施日（YYYY-MM-DD）を使用（`{ワークアウト名}_{日付}_{タイプ}.csv`） |
-| `-w, --weight <KG>` | ユーザー体重(kg)を指定（FIT内部の登録体重を上書きしてW/kgを計算） |
-| `-o, --output <FILE>` | 出力先CSVファイル名を指定（1ファイル・1種別変換時のみ） |
-| `-l, --list` | FITファイル内のメッセージ一覧と件数を表示（変換は行わない） |
-| `--include-unknown` | 生データ抽出時にFIT内部の未知フィールド (`unknown_*`) も除外せず出力 |
+| `-t, --type <TYPE...>` | Output mode / message types (`connect` (default), `record`, `lap`, `split`, `session`, `activity`, `all`, etc.) |
+| `--re-lap <DIST>` | Re-aggregates auto-lap intervals by target distance (e.g. `2000`, `2km`, `500m`) |
+| `-n, --workout-name` | Sets output filename using workout name and date: `{WorkoutName}_{Date}_{type}.csv` |
+| `-w, --weight <KG>` | Specifies athlete body weight in kg (overrides FIT profile weight for W/kg calculations) |
+| `-o, --output <FILE>` | Custom output destination path (valid when converting single file and single type) |
+| `-l, --list` | Lists all message types and message counts present in the FIT file without converting |
+| `--include-unknown` | Retains raw unresolved FIT fields (`unknown_*`) in raw export mode |
+
+---
+
+## 🔬 Technical Implementation Details
+
+### Minetti (2002) Energy Cost Model for GAP
+Garmin's web interface calculates Grade Adjusted Pace (GAP) using metabolic cost equations. `fit2csv` smooths barometric altitude with a 21-second rolling window to filter out running gait vibration noise, computes instantaneous grade $i$, and evaluates metabolic cost $C(i)$ relative to flat running:
+$$C_r(i) = \frac{155.4 i^5 - 30.4 i^4 - 32.8 i^3 + 43.7 i^2 + 19.1 i + 3.6}{3.6}$$
+Equivalent flat pace is derived via:
+$$v_{\text{flat}} = v_{\text{actual}} \times C_r(i)$$
+
+### Ground Contact Time Balance Guarantee
+Because Garmin FIT files record only the left-side percentage (`avg_stance_time_balance`), separate rounding can create sum mismatches ($100.1\%$). `fit2csv` rounds the left value to 1 decimal place and computes the right value strictly as:
+$$\text{Right}\% = 100.0\% - \text{Left}\%$$
+guaranteeing mathematical consistency across every lap and summary row.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

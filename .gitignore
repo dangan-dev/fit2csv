@@ -23,13 +23,12 @@ Thumbs.db
 # Personal and Activity Data
 *.fit
 *.csv
-test_data/
-test_data2/
 test_data*/
 
 # Editor / IDE
 .vscode/
 .idea/
+*.code-workspace
 *.swp
 *.swo
 *~

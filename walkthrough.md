@@ -1,6 +1,6 @@
 # GARMIN FIT to CSV 変換ツール Walkthrough (出力フォーマット刷新版)
 
-Garmin公式の [`garmin-fit-sdk`](https://pypi.org/project/garmin-fit-sdk/) を用いた [`fit2csv.py`](file:///Users/dangan/running/fit2csv/fit2csv.py) において、ユーザー承認計画に基づき**「Garmin Connect 準拠モード（デフォルト）」**と**「FIT 生データ抽出モード」**への関心事の分離・再設計、ならびに **`Avg GAP`（勾配調整ペース）** の Minetti モデル実装を完了しました。
+Garmin公式の [`garmin-fit-sdk`](https://pypi.org/project/garmin-fit-sdk/) を用いた [`fit2csv.py`](fit2csv.py) において、ユーザー承認計画に基づき**「Garmin Connect 準拠モード（デフォルト）」**と**「FIT 生データ抽出モード」**への関心事の分離・再設計、ならびに **`Avg GAP`（勾配調整ペース）** の Minetti モデル実装を完了しました。
 
 ---
 
